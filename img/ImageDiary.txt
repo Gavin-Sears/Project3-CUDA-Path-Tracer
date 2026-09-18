@@ -1,0 +1,16 @@
+Black images with white ball:
+I guess these technically aren't so bad. The scene is sphere.json, which from the file appears to be a ball with high emission. I guess that really would just be a white ball white a black background, but obviously nothing ahs been implemented yet. Still good to see it building, because this project had the MSVC preprocessor bug that stream compact had.
+
+Lambert cornell box:
+This was just me switching scenes to cornell.json
+
+Funky cornell boxes (green floor/ceiling, green floor and red wall):
+These were me messing with fakematerial. I made the dumb decision of putting the BDRF function in the final color calculation, and I guess that's what that looks like.
+
+White box:
+This one actually looked correct at first, then quickly brightened until everything was white. Since the funky cornel boxes, I made the fakematerial call scatterray, which updates the ray bounce and multiplies by material color (for diffuse). However, this is going to be an issue of stopping the threads from continuing to calculate light after they are supposed to be gone (stream compaction should be the solution).
+
+Kinda normal looking cornell box:
+Success! We have something cool looking. However, I will admit that I simply added an if statement to the intersection and shading kernels. This causes warp divergence, but I will fix it tomorrow, because I am very tired and wanted a win before I finished for the first day.
+Bonus: creepy dark cornell box:
+This is what happens when you add the if statement to the intersections, but not the shading.
