@@ -396,6 +396,8 @@ int main(int argc, char** argv)
 
 void saveImage()
 {
+    pathtraceCopyImageToHost();
+
     float samples = iteration;
     // output image file
     Image img(width, height);

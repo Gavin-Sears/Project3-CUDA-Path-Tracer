@@ -14,3 +14,6 @@ Kinda normal looking cornell box:
 Success! We have something cool looking. However, I will admit that I simply added an if statement to the intersection and shading kernels. This causes warp divergence, but I will fix it tomorrow, because I am very tired and wanted a win before I finished for the first day.
 Bonus: creepy dark cornell box:
 This is what happens when you add the if statement to the intersections, but not the shading.
+
+cornell.2026-09-21_03-04-06z.5000samp:
+I noticed that my "kinda normal" render was slightly lighter than the reference. After some poking around, I noticed that paths that terminated because they hit the max bounce number were contributing a mix of random colors to the final image. When changing that color to black, it suddenly wasn't as weird and bright, and started looking like the reference.

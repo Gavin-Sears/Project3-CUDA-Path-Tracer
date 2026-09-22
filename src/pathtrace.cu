@@ -6,6 +6,8 @@
 #include <thrust/execution_policy.h>
 #include <thrust/random.h>
 #include <thrust/remove.h>
+#include <cub/device/device_radix_sort.cuh>
+#include <utility>
 
 #include "sceneStructs.h"
 #include "scene.h"
@@ -14,6 +16,11 @@
 #include "utilities.h"
 #include "intersections.h"
 #include "interactions.h"
+
+#define SORTPATHSBYMATERIAL 1
+
+#define SORT_MIN_PATHS 16384
+#define SORT_MIN_DEPTH 2
 
 #define ERRORCHECK 1
 
@@ -41,6 +48,13 @@ void checkCUDAErrorFn(const char* msg, const char* file, int line)
     exit(EXIT_FAILURE);
 #endif // ERRORCHECK
 }
+
+// indicator to pass into remove_if
+struct max_reached {
+    __host__ __device__ bool operator()(const PathSegment p) {
+        return p.remainingBounces <= 0;
+    }
+};
 
 __host__ __device__
 thrust::default_random_engine makeSeededRandomEngine(int iter, int index, int depth)
@@ -83,6 +97,83 @@ static ShadeableIntersection* dev_intersections = NULL;
 // TODO: static variables for device memory, any extra info you need, etc
 // ...
 
+#if SORTPATHSBYMATERIAL
+// Arrays that we use for final gather with radix sort.
+static PathSegment* dev_paths_sorted = NULL;
+static ShadeableIntersection* dev_intersections_sorted = NULL;
+
+// These are unsorted (in) and sorted (out) arrays of all material indices in intersections.
+static unsigned int* dev_sort_keys_in = NULL;
+static unsigned int* dev_sort_keys_out = NULL;
+
+// These arrays will hold unsorted and sorted indices intersection and path arrays.
+static int* dev_sort_idx_in = NULL;
+static int* dev_sort_idx_out = NULL;
+
+// Scratch space for radix sort.
+static void* dev_sort_temp = NULL;
+static size_t sort_temp_bytes = 0;
+static int sort_end_bit = 1;
+
+// Key 0 is reserved for paths that missed everything (materialId == -1)
+__global__ void buildMaterialSortKeys(int n, const ShadeableIntersection* intersections,
+    unsigned int* keys, int* indices)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n)
+    {
+        keys[idx] = (unsigned int)(intersections[idx].materialId + 1);
+        indices[idx] = idx;
+    }
+}
+
+__global__ void gatherSortedPaths(int n, const int* sortedIndices,
+    const PathSegment* pathsIn, PathSegment* pathsOut,
+    const ShadeableIntersection* intersectionsIn, ShadeableIntersection* intersectionsOut)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n)
+    {
+        int src = sortedIndices[idx];
+        pathsOut[idx] = pathsIn[src];
+        intersectionsOut[idx] = intersectionsIn[src];
+    }
+}
+
+// Sorts
+static void sortPathsByMaterial(int num_paths, int blockSize1d)
+{
+    const int blocks = (num_paths + blockSize1d - 1) / blockSize1d;
+
+    // Much like naive boids, we build an array of indices that we sort with a temp array
+    buildMaterialSortKeys<<<blocks, blockSize1d>>>(
+        num_paths, dev_intersections, dev_sort_keys_in, dev_sort_idx_in);
+
+    size_t temp_bytes = sort_temp_bytes;
+    // This function call is very confusing, so here is a guide:
+    // In dev_sort_keys_out and dev_sort_idx_out (which have length num_paths) we store values of
+    // dev_sort_keys_in and dev_sort_idx_in that are sorted based on bits zero (0, second to last argument) 
+    // through sort_end_bit (an integer) of the values in dev_sort_keys_in (which are materialId).
+    // temp_bytes number of bytes are used for scratch space, in the array dev_sort_temp 
+    // (which is initialized in pathtraceinit). The two "out" arrays are sorted at the end, but the sorted
+    // key array is useless right now because it is just a bunch of sorted material IDs, which we can find using the
+    // indices anyways.
+    cub::DeviceRadixSort::SortPairs(dev_sort_temp, temp_bytes,
+        dev_sort_keys_in, dev_sort_keys_out, dev_sort_idx_in, dev_sort_idx_out,
+        num_paths, 0, sort_end_bit);
+
+    // Gather ala naive boids, but with two arrays
+    gatherSortedPaths<<<blocks, blockSize1d>>>(
+        num_paths, dev_sort_idx_out,
+        dev_paths, dev_paths_sorted,
+        dev_intersections, dev_intersections_sorted);
+
+    // Swap sorted arrays with original now that we are done.
+    std::swap(dev_paths, dev_paths_sorted);
+    std::swap(dev_intersections, dev_intersections_sorted);
+}
+#endif
+
 void InitDataContainer(GuiDataContainer* imGuiData)
 {
     guiData = imGuiData;
@@ -107,9 +198,35 @@ void pathtraceInit(Scene* scene)
     cudaMemcpy(dev_materials, scene->materials.data(), scene->materials.size() * sizeof(Material), cudaMemcpyHostToDevice);
 
     cudaMalloc(&dev_intersections, pixelcount * sizeof(ShadeableIntersection));
-    cudaMemset(dev_intersections, 0, pixelcount * sizeof(ShadeableIntersection));
+    cudaMemset(dev_intersections, -1, pixelcount * sizeof(ShadeableIntersection));
 
-    // TODO: initialize any extra device memeory you need
+#if SORTPATHSBYMATERIAL
+    cudaMalloc(&dev_paths_sorted, pixelcount * sizeof(PathSegment));
+    cudaMalloc(&dev_intersections_sorted, pixelcount * sizeof(ShadeableIntersection));
+    cudaMalloc(&dev_sort_keys_in, pixelcount * sizeof(unsigned int));
+    cudaMalloc(&dev_sort_keys_out, pixelcount * sizeof(unsigned int));
+    cudaMalloc(&dev_sort_idx_in, pixelcount * sizeof(int));
+    cudaMalloc(&dev_sort_idx_out, pixelcount * sizeof(int));
+
+    // Since materialId is such a small data type (uint) with few values, we
+    // calculate the minimum number of bits needed to do radix sort on the value.
+    sort_end_bit = 1;
+    while ((1u << sort_end_bit) < scene->materials.size() + 1)
+    {
+        sort_end_bit++;
+    }
+
+    // This CUB (CUDA UnBound) radix sort function requires scratch space.
+    // To get the correct amount into sort_temp_bytes, we must run the function itself without any scratch space initialized.
+    // All of these parameters will be the same every time we sort, except for num_paths, so we run the function
+    // with the max number of paths (pixelcount) so that we always have enough scratch space.
+    // I feel like this is super unintuitive, so I figure I will appreciate having this note in the future.
+    sort_temp_bytes = 0;
+    cub::DeviceRadixSort::SortPairs(NULL, sort_temp_bytes,
+        dev_sort_keys_in, dev_sort_keys_out, dev_sort_idx_in, dev_sort_idx_out,
+        pixelcount, 0, sort_end_bit);
+    cudaMalloc(&dev_sort_temp, sort_temp_bytes);
+#endif
 
     checkCUDAError("pathtraceInit");
 }
@@ -121,9 +238,32 @@ void pathtraceFree()
     cudaFree(dev_geoms);
     cudaFree(dev_materials);
     cudaFree(dev_intersections);
-    // TODO: clean up any extra device memory you created
+#if SORTPATHSBYMATERIAL
+    cudaFree(dev_paths_sorted);
+    cudaFree(dev_intersections_sorted);
+    cudaFree(dev_sort_keys_in);
+    cudaFree(dev_sort_keys_out);
+    cudaFree(dev_sort_idx_in);
+    cudaFree(dev_sort_idx_out);
+    cudaFree(dev_sort_temp);
+#endif
 
     checkCUDAError("pathtraceFree");
+}
+
+void pathtraceCopyImageToHost()
+{
+    if (!hst_scene || !dev_image)
+    {
+        return;
+    }
+
+    const Camera& cam = hst_scene->state.camera;
+    const int pixelcount = cam.resolution.x * cam.resolution.y;
+    cudaMemcpy(hst_scene->state.image.data(), dev_image,
+        pixelcount * sizeof(glm::vec3), cudaMemcpyDeviceToHost);
+
+    checkCUDAError("pathtraceCopyImageToHost");
 }
 
 /**
@@ -142,14 +282,16 @@ __global__ void generateRayFromCamera(Camera cam, int iter, int traceDepth, Path
     if (x < cam.resolution.x && y < cam.resolution.y) {
         int index = x + (y * cam.resolution.x);
         PathSegment& segment = pathSegments[index];
+        thrust::default_random_engine rng = makeSeededRandomEngine(iter, segment.pixelIndex, segment.remainingBounces);
+        thrust::uniform_real_distribution<float> u01(-0.5, 0.5);
 
         segment.ray.origin = cam.position;
         segment.color = glm::vec3(1.0f, 1.0f, 1.0f);
 
         // TODO: implement antialiasing by jittering the ray
         segment.ray.direction = glm::normalize(cam.view
-            - cam.right * cam.pixelLength.x * ((float)x - (float)cam.resolution.x * 0.5f)
-            - cam.up * cam.pixelLength.y * ((float)y - (float)cam.resolution.y * 0.5f)
+            - cam.right * cam.pixelLength.x * ((float)x - (float)cam.resolution.x * 0.5f + u01(rng))
+            - cam.up * cam.pixelLength.y * ((float)y - (float)cam.resolution.y * 0.5f + u01(rng))
         );
 
         segment.pixelIndex = index;
@@ -241,7 +383,8 @@ __global__ void shadeFakeMaterial(
     int num_paths,
     ShadeableIntersection* shadeableIntersections,
     PathSegment* pathSegments,
-    Material* materials)
+    Material* materials,
+    glm::vec3* image)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < num_paths)
@@ -253,7 +396,7 @@ __global__ void shadeFakeMaterial(
           // Set up the RNG
           // LOOK: this is how you use thrust's RNG! Please look at
           // makeSeededRandomEngine as well.
-            thrust::default_random_engine rng = makeSeededRandomEngine(iter, idx, pathSegments[idx].remainingBounces);
+            thrust::default_random_engine rng = makeSeededRandomEngine(iter, pathSegments[idx].pixelIndex, pathSegments[idx].remainingBounces);
             thrust::uniform_real_distribution<float> u01(0, 1);
 
             Material material = materials[intersection.materialId];
@@ -263,6 +406,8 @@ __global__ void shadeFakeMaterial(
             if (material.emittance > 0.0f) {
                 pathSegments[idx].color *= (materialColor * material.emittance);
                 pathSegments[idx].remainingBounces = 0;
+                // Will need to be changed once there is more than one path per pixel.
+                image[pathSegments[idx].pixelIndex] += pathSegments[idx].color;
             }
             // Otherwise, do some pseudo-lighting computation. This is actually more
             // like what you would expect from shading in a rasterizer like OpenGL.
@@ -275,6 +420,7 @@ __global__ void shadeFakeMaterial(
                     getPointOnRay(pathSegments[idx].ray, intersection.t), 
                     intersection.surfaceNormal, material, rng
                 );
+                // A path that runs out of bounces without reaching a light adds nothing.
             }
             // If there was no intersection, color the ray black.
             // Lots of renderers use 4 channel color, RGBA, where A = alpha, often
@@ -348,8 +494,6 @@ void pathtrace(uchar4* pbo, int frame, int iter)
     // * Finally, add this iteration's results to the image. This has been done
     //   for you.
 
-    // TODO: perform one iteration of path tracing
-
     generateRayFromCamera<<<blocksPerGrid2d, blockSize2d>>>(cam, iter, traceDepth, dev_paths);
     checkCUDAError("generate camera ray");
 
@@ -364,7 +508,7 @@ void pathtrace(uchar4* pbo, int frame, int iter)
     while (!iterationComplete)
     {
         // clean shading chunks
-        cudaMemset(dev_intersections, 0, pixelcount * sizeof(ShadeableIntersection));
+        cudaMemset(dev_intersections, -1, num_paths * sizeof(ShadeableIntersection));
 
         // tracing
         dim3 numblocksPathSegmentTracing = (num_paths + blockSize1d - 1) / blockSize1d;
@@ -380,6 +524,13 @@ void pathtrace(uchar4* pbo, int frame, int iter)
         cudaDeviceSynchronize();
         depth++;
 
+        #if SORTPATHSBYMATERIAL
+        if (depth >= SORT_MIN_DEPTH && num_paths >= SORT_MIN_PATHS)
+        {
+            sortPathsByMaterial(num_paths, blockSize1d);
+        }
+        #endif
+
         // TODO:
         // --- Shading Stage ---
         // Shade path segments based on intersections and generate new rays by
@@ -394,10 +545,16 @@ void pathtrace(uchar4* pbo, int frame, int iter)
             num_paths,
             dev_intersections,
             dev_paths,
-            dev_materials
+            dev_materials,
+            dev_image
         );
 
-        iterationComplete = depth >= traceDepth; // TODO: should be based off stream compaction results.
+        // in dev_paths: remove_if path has terminated
+        PathSegment* new_end = thrust::remove_if(thrust::device, dev_paths, dev_paths + num_paths, max_reached());
+        // then lower length of num_paths to match new array
+        num_paths = new_end - dev_paths;
+        //iterationComplete = depth >= traceDepth; // TODO: should be based off stream compaction results.
+        iterationComplete = num_paths <= 0;
 
         if (guiData != NULL)
         {
@@ -406,17 +563,14 @@ void pathtrace(uchar4* pbo, int frame, int iter)
     }
 
     // Assemble this iteration and apply it to the image
-    dim3 numBlocksPixels = (pixelcount + blockSize1d - 1) / blockSize1d;
-    finalGather<<<numBlocksPixels, blockSize1d>>>(num_paths, dev_image, dev_paths);
+    // Not needed anymore because of stream compaction
+    /*dim3 numBlocksPixels = (pixelcount + blockSize1d - 1) / blockSize1d;
+    finalGather<<<numBlocksPixels, blockSize1d>>>(num_paths, dev_image, dev_paths);*/
 
     ///////////////////////////////////////////////////////////////////////////
 
     // Send results to OpenGL buffer for rendering
     sendImageToPBO<<<blocksPerGrid2d, blockSize2d>>>(pbo, cam.resolution, iter, dev_image);
-
-    // Retrieve image from GPU
-    cudaMemcpy(hst_scene->state.image.data(), dev_image,
-        pixelcount * sizeof(glm::vec3), cudaMemcpyDeviceToHost);
 
     checkCUDAError("pathtrace");
 }
