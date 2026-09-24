@@ -19,7 +19,7 @@
 
 #define SORTPATHSBYMATERIAL 1
 
-#define BVH 1
+#define BVH 0
 #define BVH_STACK_SIZE 64
 
 #define SORT_MIN_PATHS 16384

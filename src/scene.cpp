@@ -91,15 +91,23 @@ void Scene::loadFromJSON(const std::string& jsonName)
                 std::cout << "mesh will not render" << std::endl;
             }
 
+            // position we will add upcoming bvh node to
+            size_t nodesBefore = bvhNodes.size();
+
+            // construct bvh tree
+            newGeom.bvhRoot = constructBVH(newTriangles, bvhNodes);
+
             // starting index for this mesh's triangles is the end of the scene's current triangles
             newGeom.triangleStart = triangles.size();
             newGeom.triangleCount = newTriangles.size();
 
+            // Shift all bvh triangles up by triangle start, since we can have more than one bvh
+            for (size_t nodeIdx = nodesBefore; nodeIdx < bvhNodes.size(); ++nodeIdx)
+                if (bvhNodes[nodeIdx].triangleCount > 0)
+                    bvhNodes[nodeIdx].triangleStart += newGeom.triangleStart;
+
             // adding to scene's triangles
             triangles.insert(triangles.end(), newTriangles.begin(), newTriangles.end());
-
-            // construct bvh tree
-            newGeom.bvhRoot = constructBVH(triangles, bvhNodes);
 
             // finally, we mark the geometry as a mesh
             newGeom.type = MESH;
