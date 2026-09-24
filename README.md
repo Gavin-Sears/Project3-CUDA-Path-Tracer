@@ -3,11 +3,19 @@ CUDA Path Tracer
 
 **University of Pennsylvania, CIS 565: GPU Programming and Architecture, Project 3**
 
-* (TODO) YOUR NAME HERE
-* Tested on: (TODO) Windows 22, i7-2222 @ 2.22GHz 22GB, GTX 222 222MB (Moore 2222 Lab)
+* Stephen Gavin Sears
+  * [LinkedIn](https://www.linkedin.com/in/gavin-sears-536a1b285), [personal website](https://gavin-sears.github.io/sgavinsears/index.html)
+* Tested on: Windows 11, i9-14900HX @ 2.20GHz 32GB, RTX 4090 Laptop 16GB, Compute Capability 8.9 (Personal Computer)
 
-### (TODO: Your README)
+### Basic Pathtracer
 
-*DO NOT* leave the README to the last minute! It is a crucial part of the
-project, and we will not be able to grade you without a good README.
+![](img/base_pathtracer.png)
 
+### Extra Features
+
+### CHANGED CmakeLists.txt:
+
+I added mesh.h to headers and mesh.cpp to sources for mesh loading.
+
+With BVH:
+Render time: 161.244 s (5000 iterations)

@@ -19,6 +19,9 @@
 
 #define SORTPATHSBYMATERIAL 1
 
+#define BVH 1
+#define BVH_STACK_SIZE 64
+
 #define SORT_MIN_PATHS 16384
 #define SORT_MIN_DEPTH 2
 
@@ -92,6 +95,8 @@ static GuiDataContainer* guiData = NULL;
 static glm::vec3* dev_image = NULL;
 static Geom* dev_geoms = NULL;
 static Material* dev_materials = NULL;
+static Triangle* dev_triangles = NULL;
+static BVHNode* dev_bvhNodes = NULL;
 static PathSegment* dev_paths = NULL;
 static ShadeableIntersection* dev_intersections = NULL;
 // TODO: static variables for device memory, any extra info you need, etc
@@ -197,6 +202,12 @@ void pathtraceInit(Scene* scene)
     cudaMalloc(&dev_materials, scene->materials.size() * sizeof(Material));
     cudaMemcpy(dev_materials, scene->materials.data(), scene->materials.size() * sizeof(Material), cudaMemcpyHostToDevice);
 
+    cudaMalloc(&dev_triangles, scene->triangles.size() * sizeof(Triangle));
+    cudaMemcpy(dev_triangles, scene->triangles.data(), scene->triangles.size() * sizeof(Triangle), cudaMemcpyHostToDevice);
+    
+    cudaMalloc(&dev_bvhNodes, scene->bvhNodes.size() * sizeof(BVHNode));
+    cudaMemcpy(dev_bvhNodes, scene->bvhNodes.data(), scene->bvhNodes.size() * sizeof(BVHNode), cudaMemcpyHostToDevice);
+
     cudaMalloc(&dev_intersections, pixelcount * sizeof(ShadeableIntersection));
     cudaMemset(dev_intersections, -1, pixelcount * sizeof(ShadeableIntersection));
 
@@ -237,6 +248,8 @@ void pathtraceFree()
     cudaFree(dev_paths);
     cudaFree(dev_geoms);
     cudaFree(dev_materials);
+    cudaFree(dev_triangles);
+    cudaFree(dev_bvhNodes);
     cudaFree(dev_intersections);
 #if SORTPATHSBYMATERIAL
     cudaFree(dev_paths_sorted);
@@ -308,6 +321,8 @@ __global__ void computeIntersections(
     int num_paths,
     PathSegment* pathSegments,
     Geom* geoms,
+    Triangle* triangles,
+    BVHNode* bvhNodes,
     int geoms_size,
     ShadeableIntersection* intersections)
 {
@@ -341,6 +356,80 @@ __global__ void computeIntersections(
             else if (geom.type == SPHERE)
             {
                 t = sphereIntersectionTest(geom, pathSegment.ray, tmp_intersect, tmp_normal, outside);
+            }
+            else if (geom.type == MESH)
+            {
+                glm::vec3 minInter;
+                glm::vec3 minNorm;
+
+                t = FLT_MAX;
+
+                // This ray used for triangle intersection is transformed into mesh space,
+                // as opposed to the triangles being transformed.
+                Ray localRay;
+                localRay.origin = multiplyMV(geom.inverseTransform, glm::vec4(pathSegment.ray.origin, 1.0f));
+                localRay.direction = glm::normalize(multiplyMV(geom.inverseTransform, glm::vec4(pathSegment.ray.direction, 0.0f)));
+
+#if BVH
+                if (geom.bvhRoot >= 0)
+                {
+                    size_t stack[BVH_STACK_SIZE];
+                    int stackPtr = 0;
+                    stack[stackPtr++] = (size_t)geom.bvhRoot;
+
+                    while (stackPtr > 0)
+                    {
+                        size_t nodeIdx = stack[--stackPtr];
+                        BVHNode node = bvhNodes[nodeIdx];
+
+                        float tNear;
+                        // No intersection with BVH
+                        if (!aabbIntersectionTest(node.boundsMin, node.boundsMax, localRay, tNear))
+                        {
+                            continue;
+                        }
+                        // Intersection is farther than nearest intersection already found
+                        if (tNear > t)
+                        {
+                            continue;
+                        }
+
+                        // Otheriwise, we:
+                        // loop through triangles if we hit a leaf node
+                        if (node.triangleCount > 0)
+                        {
+                            for (size_t tIdx = node.triangleStart; tIdx < node.triangleStart + node.triangleCount; ++tIdx)
+                            {
+                                Triangle tri = triangles[tIdx];
+                                float curt = triangleIntersectionTest(geom, tri, pathSegment.ray, localRay, minInter, minNorm, outside);
+                                if (curt < t && curt > 0)
+                                {
+                                    t = curt;
+                                    tmp_intersect = minInter;
+                                    tmp_normal = minNorm;
+                                }
+                            }
+                        }
+                        // or continue to children if we are not in a leaf node
+                        else
+                        {
+                            stack[stackPtr++] = node.leftChild;
+                            stack[stackPtr++] = node.rightChild;
+                        }
+                    }
+                }
+#else
+                for (size_t tIdx = geom.triangleStart; tIdx < geom.triangleStart + geom.triangleCount; ++tIdx) {
+                    Triangle tri = triangles[tIdx];
+                    float curt = triangleIntersectionTest(geom, tri, pathSegment.ray, localRay, minInter, minNorm, outside);
+                    if (curt < t && curt > 0)
+                    {
+                        t = curt;
+                        tmp_intersect = minInter;
+                        tmp_normal = minNorm;
+                    }
+                }
+#endif
             }
             // TODO: add more intersection tests here... triangle? metaball? CSG?
 
@@ -517,6 +606,8 @@ void pathtrace(uchar4* pbo, int frame, int iter)
             num_paths,
             dev_paths,
             dev_geoms,
+            dev_triangles,
+            dev_bvhNodes,
             hst_scene->geoms.size(),
             dev_intersections
         );

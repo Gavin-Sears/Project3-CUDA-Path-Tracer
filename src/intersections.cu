@@ -111,3 +111,59 @@ __host__ __device__ float sphereIntersectionTest(
 
     return glm::length(r.origin - intersectionPoint);
 }
+
+__host__ __device__ float triangleIntersectionTest(
+    Geom mesh,
+    Triangle tri,
+    Ray r,
+    Ray localRay,
+    glm::vec3 &intersectionPoint,
+    glm::vec3 &normal,
+    bool &outside)
+{
+    glm::vec3 baryPosition;
+    if (!glm::intersectRayTriangle(localRay.origin, localRay.direction, tri.v0, tri.v1, tri.v2, baryPosition))
+    {
+        return -1;
+    }
+
+    float t = baryPosition.z;
+    if (t <= 0.0f)
+    {
+        return -1;
+    }
+
+    glm::vec3 objspaceIntersection = getPointOnRay(localRay, t);
+
+    float u = baryPosition.x;
+    float v = baryPosition.y;
+    glm::vec3 objspaceNormal = glm::normalize((1.0f - u - v) * tri.n0 + u * tri.n1 + v * tri.n2);
+
+    intersectionPoint = multiplyMV(mesh.transform, glm::vec4(objspaceIntersection, 1.f));
+    normal = glm::normalize(multiplyMV(mesh.invTranspose, glm::vec4(objspaceNormal, 0.f)));
+    // glm::intersectRayTriangle already back-face culls
+    outside = true;
+
+    return glm::length(r.origin - intersectionPoint);
+}
+
+__host__ __device__ bool aabbIntersectionTest(
+    glm::vec3 boundsMin,
+    glm::vec3 boundsMax,
+    Ray r,
+    float &tNear)
+{
+    float tmin = -1e38f;
+    float tmax = 1e38f;
+    for (int axis = 0; axis < 3; ++axis)
+    {
+        float invD = 1.0f / r.direction[axis];
+        float t0 = (boundsMin[axis] - r.origin[axis]) * invD;
+        float t1 = (boundsMax[axis] - r.origin[axis]) * invD;
+        tmin = glm::max(tmin, glm::min(t0, t1));
+        tmax = glm::min(tmax, glm::max(t0, t1));
+    }
+
+    tNear = tmin;
+    return tmax >= tmin && tmax > 0.0f;
+}

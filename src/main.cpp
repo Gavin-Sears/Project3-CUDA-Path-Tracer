@@ -24,9 +24,17 @@
 #include <sstream>
 #include <string>
 #include <filesystem>
+#include <chrono>
+
+#define RENDERTIMETXT 0
+
 namespace fs = std::filesystem;
 
 static std::string startTimeString;
+
+// Timer for the current render
+static std::chrono::steady_clock::time_point renderStartTime;
+static bool renderTimerRunning = false;
 
 // For camera controls
 static bool leftMousePressed = false;
@@ -74,6 +82,25 @@ std::string currentTimeString()
     char buf[sizeof "0000-00-00_00-00-00z"];
     strftime(buf, sizeof buf, "%Y-%m-%d_%H-%M-%Sz", gmtime(&now));
     return std::string(buf);
+}
+
+void printRenderTime()
+{
+    if (!renderTimerRunning)
+    {
+        return;
+    }
+    double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - renderStartTime).count();
+    printf("Render time: %.3f s (%d iterations)\n", elapsed, iteration);
+
+#if RENDERTIMETXT
+    FILE* logFile = fopen("render_times.txt", "a");
+    if (logFile)
+    {
+        fprintf(logFile, "Render time: %.3f s (%d iterations)\n", elapsed, iteration);
+        fclose(logFile);
+    }
+#endif
 }
 
 //-------------------------------
@@ -343,6 +370,7 @@ void mainLoop()
 int main(int argc, char** argv)
 {
     startTimeString = currentTimeString();
+    atexit(printRenderTime);
 
     if (argc < 2)
     {
@@ -459,6 +487,8 @@ void runCuda()
     {
         pathtraceFree();
         pathtraceInit(scene);
+        renderStartTime = std::chrono::steady_clock::now();
+        renderTimerRunning = true;
     }
 
     if (iteration < renderState->iterations)

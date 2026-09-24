@@ -1,4 +1,6 @@
 #include "scene.h"
+#include "mesh.h"
+#include "bvh.h"
 
 #include "utilities.h"
 
@@ -6,6 +8,7 @@
 #include <glm/gtx/string_cast.hpp>
 #include "json.hpp"
 
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -13,6 +16,7 @@
 
 using namespace std;
 using json = nlohmann::json;
+namespace fs = std::filesystem;
 
 Scene::Scene(string filename)
 {
@@ -71,8 +75,39 @@ void Scene::loadFromJSON(const std::string& jsonName)
         {
             newGeom.type = CUBE;
         }
+        else if (type == "sphere")
+        {
+            newGeom.type = SPHERE;
+        }
+        else if (type == "mesh")
+        {
+            // initializing and filling a temporary triangle array
+            std::vector<Triangle> newTriangles;
+            std::string fileName = p["FILENAME"];
+            // mesh paths are relative to the scene JSON's own directory, not the working directory
+            fs::path meshPath = fs::path(jsonName).parent_path() / fileName;
+            if (!loadMeshTriangles(meshPath.string(), newTriangles)) {
+                std::cout << "error! Failed to load " << meshPath << std::endl;
+                std::cout << "mesh will not render" << std::endl;
+            }
+
+            // starting index for this mesh's triangles is the end of the scene's current triangles
+            newGeom.triangleStart = triangles.size();
+            newGeom.triangleCount = newTriangles.size();
+
+            // adding to scene's triangles
+            triangles.insert(triangles.end(), newTriangles.begin(), newTriangles.end());
+
+            // construct bvh tree
+            newGeom.bvhRoot = constructBVH(triangles, bvhNodes);
+
+            // finally, we mark the geometry as a mesh
+            newGeom.type = MESH;
+        }
         else
         {
+            std::cout << "error! Unidentified geometry type in " << jsonName << ": " << type << std::endl;
+            std::cout << "rendering as sphere" << std::endl;
             newGeom.type = SPHERE;
         }
         newGeom.materialid = MatNameToID[p["MATERIAL"]];
