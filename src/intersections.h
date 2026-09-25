@@ -75,10 +75,7 @@ __host__ __device__ float sphereIntersectionTest(
 /**
  * Test intersection between a ray and one triangle of a mesh Geom.
  * tri holds the triangle's object-space vertices and normals.
- * Mesh contains transform.
- * localRay is `r` already transformed into the mesh's object space by the
- * caller (shared across every triangle/BVH-node test for this mesh, rather
- * than being recomputed here per triangle).
+ * r is considered to be transformed into mesh's object space beforehand.
  *
  * @param intersectionPoint  Output param for point of intersection.
  * @param normal             Output param for surface normal.
@@ -95,17 +92,22 @@ __host__ __device__ float triangleIntersectionTest(
     bool& outside);
 
 /**
- * Test intersection between a ray and an axis-aligned bounding box, e.g. a
- * BVH node's bounds. `r` must already be in the same object space the
- * bounds were computed in (see triangleIntersectionTest's `localRay`).
- * Culling-only: no intersection point/normal, just whether it's hit and,
- * if so, the near distance (useful for pruning BVH traversal).
+ * Test intersection between a ray and an axis-aligned bounding box. 
+ * r is considered to be transformed into mesh's object space beforehand.
  *
  * @param tNear  Output parameter for the near intersection distance.
- * @return       Whether the ray hits the box at all.
+ * @return       Whether the ray hits the box.
  */
 __host__ __device__ bool aabbIntersectionTest(
     glm::vec3 boundsMin,
     glm::vec3 boundsMax,
     Ray r,
     float& tNear);
+
+// Version that also outputs far distance
+__host__ __device__ bool aabbIntersectionTest(
+    glm::vec3 boundsMin,
+    glm::vec3 boundsMax,
+    Ray r,
+    float& tNear,
+    float& tFar);

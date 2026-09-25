@@ -6,7 +6,7 @@
 #include <cfloat>
 #include <vector>
 
-#define BVH_MAX_LEAF_TRIANGLES 4
+#define BVH_MAX_LEAF_TRIANGLES 64
 #define BVH_MAX_DEPTH 32
 
 namespace
@@ -60,6 +60,7 @@ namespace
         if (extent.y > extent.x) axis = 1;
         if (extent.z > extent[axis]) axis = 2;
 
+        // find median triangle index
         size_t mid = start + count / 2;
         std::nth_element(
             triangles.begin() + start, triangles.begin() + mid, triangles.begin() + start + count,

@@ -20,6 +20,15 @@ class GuiDataContainer
 public:
     GuiDataContainer() : TracedDepth(0) {}
     int TracedDepth;
+
+    // Runtime toggles
+    bool useBVH = true;
+    bool sortByMaterial = true;
+    bool visualizeBVH = false;
+    int bvhVizMode = 0;          // 0 = leaf colors, 1 = traversal heat map
+    bool bvhOutlines = true;
+
+    float iterationMs = 0.0f;
 };
 
 namespace utilityCore

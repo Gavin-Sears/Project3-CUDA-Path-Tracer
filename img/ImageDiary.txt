@@ -17,3 +17,21 @@ This is what happens when you add the if statement to the intersections, but not
 
 cornell.2026-09-21_03-04-06z.5000samp:
 I noticed that my "kinda normal" render was slightly lighter than the reference. After some poking around, I noticed that paths that terminated because they hit the max bounce number were contributing a mix of random colors to the final image. When changing that color to black, it suddenly wasn't as weird and bright, and started looking like the reference.
+
+base_pathtracer.png
+Finished part 1 path tracer, with stochastic antialiasing, material sorting, and diffuse lighting. Looks pretty similar to the reference at this point
+
+funnybunnyshadow.png
+After getting mesh loading working (most errors I ran into resulted in the program not running, so not really any good bloopers there), we have a bunny, but something is wrong. The shadow is messed up and looks like a figure eight.
+
+bunny.png
+The issue, as it turns out, was that the bunny mesh itself had holes in the bottom. This resulted in the rays hitting the ground, bouncing up into the mesh, and because backface culling is off (I use a built in glm function for triangle intersections that does backface culling), we then see light leaking through the mesh. Also, at this point I have BVH working, and I was happy to know it wasn't a BVH issue.
+
+nobvh/bvh.png
+Pictures for a comparison in the README. I was going to use the previous 1400 render for no bvh, but I think I may have had vsync on or something, so I had to scrap that.
+
+bvh_render_time.png
+Hopefully a well-formatted comparison chart for BVH. Not very meaningful given it's just two numbers, but it makes for a good visual.
+
+heatmap/colorleaves + bvh
+These are comparison pictures for a BVH debug tool. I loved seeing the BVH debug images int he presentations, so I wanted to provide one of my own. It also helped me understand more about BVH, since I have done BVH-like spatial partitioning optimizations in the past with my graphics programs, but I had never done one for a raytracer. So that was cool.

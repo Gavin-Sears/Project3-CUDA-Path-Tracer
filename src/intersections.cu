@@ -153,6 +153,17 @@ __host__ __device__ bool aabbIntersectionTest(
     Ray r,
     float &tNear)
 {
+    float tFar;
+    return aabbIntersectionTest(boundsMin, boundsMax, r, tNear, tFar);
+}
+
+__host__ __device__ bool aabbIntersectionTest(
+    glm::vec3 boundsMin,
+    glm::vec3 boundsMax,
+    Ray r,
+    float &tNear,
+    float &tFar)
+{
     float tmin = -1e38f;
     float tmax = 1e38f;
     for (int axis = 0; axis < 3; ++axis)
@@ -165,5 +176,6 @@ __host__ __device__ bool aabbIntersectionTest(
     }
 
     tNear = tmin;
+    tFar = tmax;
     return tmax >= tmin && tmax > 0.0f;
 }

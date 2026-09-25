@@ -32,9 +32,45 @@ namespace fs = std::filesystem;
 
 static std::string startTimeString;
 
-// Timer for the current render
-static std::chrono::steady_clock::time_point renderStartTime;
+// GUI button controls to start and stop rendering 
+// SET FALSE TO START WITH RENDERING DISABLE
+static bool renderRunning = true;
+static bool pathtraceInitialized = false;
+
+// Timer spent rendering for current render, excluding paused time
+static double activeSeconds = 0.0;
+// last active time, which we can update so we don't include pauses in render time
+static std::chrono::steady_clock::time_point activeSince;
 static bool renderTimerRunning = false;
+
+static double elapsedRenderSeconds()
+{
+    double elapsed = activeSeconds;
+    if (renderRunning)
+    {
+        elapsed += std::chrono::duration<double>(std::chrono::steady_clock::now() - activeSince).count();
+    }
+    return elapsed;
+}
+
+static void setRenderRunning(bool running)
+{
+    if (running == renderRunning)
+    {
+        return;
+    }
+    if (!running)
+    {
+        // If we toggle rendering off, we update the total so far.
+        activeSeconds = elapsedRenderSeconds();
+    }
+    else
+    {
+        // If we toggle to running render, then record time as start of active rendering
+        activeSince = std::chrono::steady_clock::now();
+    }
+    renderRunning = running;
+}
 
 // For camera controls
 static bool leftMousePressed = false;
@@ -90,7 +126,7 @@ void printRenderTime()
     {
         return;
     }
-    double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - renderStartTime).count();
+    double elapsed = elapsedRenderSeconds();
     printf("Render time: %.3f s (%d iterations)\n", elapsed, iteration);
 
 #if RENDERTIMETXT
@@ -245,6 +281,7 @@ bool init()
         return false;
     }
     glfwMakeContextCurrent(window);
+    glfwSwapInterval(0); // VSync off
     glfwSetKeyCallback(window, keyCallback);
     glfwSetCursorPosCallback(window, mousePositionCallback);
     glfwSetMouseButtonCallback(window, mouseButtonCallback);
@@ -293,27 +330,50 @@ void RenderImGui()
     ImGui_ImplGlfw_NewFrame();
     ImGui::NewFrame();
 
-    bool show_demo_window = true;
-    bool show_another_window = false;
-    ImVec4 clear_color = ImVec4(0.45f, 0.55f, 0.60f, 1.00f);
-    static float f = 0.0f;
-    static int counter = 0;
+    ImGui::Begin("Path Tracer Analytics");
 
-    ImGui::Begin("Path Tracer Analytics");                  // Create a window called "Hello, world!" and append into it.
-    
-    // LOOK: Un-Comment to check the output window and usage
-    ImGui::Text("This is some useful text.");               // Display some text (you can use a format strings too)
-    ImGui::Checkbox("Demo Window", &show_demo_window);      // Edit bools storing our window open/close state
-    ImGui::Checkbox("Another Window", &show_another_window);
+    // Performance readout
+    ImGui::Text("Path trace: %.2f ms/iteration (GPU)", imguiData->iterationMs);
+    ImGui::Text("Iteration %d / %d%s", iteration, renderState->iterations, renderRunning ? "" : "  (stopped)");
+    ImGui::Text("Traced depth %d", imguiData->TracedDepth);
+    ImGui::Separator();
 
-    ImGui::SliderFloat("float", &f, 0.0f, 1.0f);            // Edit 1 float using a slider from 0.0f to 1.0f
-    ImGui::ColorEdit3("clear color", (float*)&clear_color); // Edit 3 floats representing a color
-
-    if (ImGui::Button("Button"))                            // Buttons return true when clicked (most widgets return true when edited/activated)
-        counter++;
+    // Render controls
+    if (ImGui::Button(renderRunning ? "Stop rendering" : "Start rendering"))
+    {
+        setRenderRunning(!renderRunning);
+    }
     ImGui::SameLine();
-    ImGui::Text("counter = %d", counter);
-    ImGui::Text("Traced Depth %d", imguiData->TracedDepth);
+    if (ImGui::Button("Restart accumulation"))
+    {
+        camchanged = true; // camchanged is what restarts the accumulation in runCuda
+    }
+    static bool vsync = false;
+    if (ImGui::Checkbox("VSync", &vsync))
+    {
+        glfwSwapInterval(vsync ? 1 : 0);
+    }
+    ImGui::Separator();
+
+    // Toggles (BVH use and material sorting don't change the image, so they don't restart it)
+    ImGui::Checkbox("Use BVH", &imguiData->useBVH);
+    if (!imguiData->useBVH)
+    {
+        ImGui::TextColored(ImVec4(0.8f, 0.1f, 0.1f, 1.0f), "BVH off: big meshes take many seconds per iteration");
+    }
+    ImGui::Checkbox("Sort paths by material", &imguiData->sortByMaterial);
+    if (ImGui::Checkbox("Visualize BVH", &imguiData->visualizeBVH))
+    {
+        camchanged = true;
+    }
+    if (imguiData->visualizeBVH)
+    {
+        if (ImGui::RadioButton("Leaf colors", &imguiData->bvhVizMode, 0)) camchanged = true;
+        ImGui::SameLine();
+        if (ImGui::RadioButton("Traversal heat map", &imguiData->bvhVizMode, 1)) camchanged = true;
+        if (ImGui::Checkbox("Outline boxes", &imguiData->bvhOutlines)) camchanged = true;
+    }
+    ImGui::Separator();
     ImGui::Text("Application average %.3f ms/frame (%.1f FPS)", 1000.0f / ImGui::GetIO().Framerate, ImGui::GetIO().Framerate);
     ImGui::End();
 
@@ -459,6 +519,12 @@ void saveImage()
 
 void runCuda()
 {
+    // if rendering is stopped, don't update the view
+    if (!renderRunning)
+    {
+        return;
+    }
+
     if (camchanged)
     {
         iteration = 0;
@@ -485,9 +551,18 @@ void runCuda()
 
     if (iteration == 0)
     {
-        pathtraceFree();
-        pathtraceInit(scene);
-        renderStartTime = std::chrono::steady_clock::now();
+        if (!pathtraceInitialized)
+        {
+            pathtraceInit(scene);
+            pathtraceInitialized = true;
+        }
+        else
+        {
+            // clear image for restart
+            pathtraceReset();
+        }
+        activeSeconds = 0.0;
+        activeSince = std::chrono::steady_clock::now();
         renderTimerRunning = true;
     }
 

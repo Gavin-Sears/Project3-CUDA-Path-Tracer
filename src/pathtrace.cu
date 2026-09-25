@@ -17,15 +17,15 @@
 #include "intersections.h"
 #include "interactions.h"
 
-#define SORTPATHSBYMATERIAL 1
-
-#define BVH 0
 #define BVH_STACK_SIZE 64
+
+#define BVH_HEAT_MAX 96.0f
+#define BVH_OUTLINE_PIXELS 1.5f
 
 #define SORT_MIN_PATHS 16384
 #define SORT_MIN_DEPTH 2
 
-#define ERRORCHECK 1
+#define ERRORCHECK 0
 
 #define FILENAME (strrchr(__FILE__, '/') ? strrchr(__FILE__, '/') + 1 : __FILE__)
 #define checkCUDAError(msg) checkCUDAErrorFn(msg, FILENAME, __LINE__)
@@ -102,7 +102,10 @@ static ShadeableIntersection* dev_intersections = NULL;
 // TODO: static variables for device memory, any extra info you need, etc
 // ...
 
-#if SORTPATHSBYMATERIAL
+// Timing for the GUI
+static cudaEvent_t evStart = NULL;
+static cudaEvent_t evStop = NULL;
+
 // Arrays that we use for final gather with radix sort.
 static PathSegment* dev_paths_sorted = NULL;
 static ShadeableIntersection* dev_intersections_sorted = NULL;
@@ -145,7 +148,6 @@ __global__ void gatherSortedPaths(int n, const int* sortedIndices,
     }
 }
 
-// Sorts
 static void sortPathsByMaterial(int num_paths, int blockSize1d)
 {
     const int blocks = (num_paths + blockSize1d - 1) / blockSize1d;
@@ -177,7 +179,6 @@ static void sortPathsByMaterial(int num_paths, int blockSize1d)
     std::swap(dev_paths, dev_paths_sorted);
     std::swap(dev_intersections, dev_intersections_sorted);
 }
-#endif
 
 void InitDataContainer(GuiDataContainer* imGuiData)
 {
@@ -211,7 +212,7 @@ void pathtraceInit(Scene* scene)
     cudaMalloc(&dev_intersections, pixelcount * sizeof(ShadeableIntersection));
     cudaMemset(dev_intersections, -1, pixelcount * sizeof(ShadeableIntersection));
 
-#if SORTPATHSBYMATERIAL
+    // Sort buffers always allocated so we can toggle material sorting
     cudaMalloc(&dev_paths_sorted, pixelcount * sizeof(PathSegment));
     cudaMalloc(&dev_intersections_sorted, pixelcount * sizeof(ShadeableIntersection));
     cudaMalloc(&dev_sort_keys_in, pixelcount * sizeof(unsigned int));
@@ -237,7 +238,9 @@ void pathtraceInit(Scene* scene)
         dev_sort_keys_in, dev_sort_keys_out, dev_sort_idx_in, dev_sort_idx_out,
         pixelcount, 0, sort_end_bit);
     cudaMalloc(&dev_sort_temp, sort_temp_bytes);
-#endif
+
+    cudaEventCreate(&evStart);
+    cudaEventCreate(&evStop);
 
     checkCUDAError("pathtraceInit");
 }
@@ -251,7 +254,6 @@ void pathtraceFree()
     cudaFree(dev_triangles);
     cudaFree(dev_bvhNodes);
     cudaFree(dev_intersections);
-#if SORTPATHSBYMATERIAL
     cudaFree(dev_paths_sorted);
     cudaFree(dev_intersections_sorted);
     cudaFree(dev_sort_keys_in);
@@ -259,9 +261,27 @@ void pathtraceFree()
     cudaFree(dev_sort_idx_in);
     cudaFree(dev_sort_idx_out);
     cudaFree(dev_sort_temp);
-#endif
+
+    // reset event objects
+    if (evStart) cudaEventDestroy(evStart);
+    if (evStop) cudaEventDestroy(evStop);
+    evStart = evStop = NULL;
 
     checkCUDAError("pathtraceFree");
+}
+
+void pathtraceReset()
+{
+    if (!hst_scene || !dev_image)
+    {
+        return;
+    }
+
+    const Camera& cam = hst_scene->state.camera;
+    const int pixelcount = cam.resolution.x * cam.resolution.y;
+    cudaMemset(dev_image, 0, pixelcount * sizeof(glm::vec3));
+
+    checkCUDAError("pathtraceReset");
 }
 
 void pathtraceCopyImageToHost()
@@ -324,7 +344,8 @@ __global__ void computeIntersections(
     Triangle* triangles,
     BVHNode* bvhNodes,
     int geoms_size,
-    ShadeableIntersection* intersections)
+    ShadeableIntersection* intersections,
+    bool useBVH)
 {
     int path_index = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -370,9 +391,14 @@ __global__ void computeIntersections(
                 localRay.origin = multiplyMV(geom.inverseTransform, glm::vec4(pathSegment.ray.origin, 1.0f));
                 localRay.direction = glm::normalize(multiplyMV(geom.inverseTransform, glm::vec4(pathSegment.ray.direction, 0.0f)));
 
-#if BVH
-                if (geom.bvhRoot >= 0)
+                if (useBVH)
                 {
+                  if (geom.bvhRoot >= 0)
+                  {
+                    // aabbintersectionTest returns a value in object space, so we need a way to convert it to world
+                    // space before comparing it to regular 
+                    float toWorld = glm::length(multiplyMV(geom.transform, glm::vec4(localRay.direction, 0.0f)));
+
                     size_t stack[BVH_STACK_SIZE];
                     int stackPtr = 0;
                     stack[stackPtr++] = (size_t)geom.bvhRoot;
@@ -389,7 +415,7 @@ __global__ void computeIntersections(
                             continue;
                         }
                         // Intersection is farther than nearest intersection already found
-                        if (tNear > t)
+                        if (tNear * toWorld > t)
                         {
                             continue;
                         }
@@ -417,19 +443,21 @@ __global__ void computeIntersections(
                             stack[stackPtr++] = node.rightChild;
                         }
                     }
+                  }
                 }
-#else
-                for (size_t tIdx = geom.triangleStart; tIdx < geom.triangleStart + geom.triangleCount; ++tIdx) {
-                    Triangle tri = triangles[tIdx];
-                    float curt = triangleIntersectionTest(geom, tri, pathSegment.ray, localRay, minInter, minNorm, outside);
-                    if (curt < t && curt > 0)
-                    {
-                        t = curt;
-                        tmp_intersect = minInter;
-                        tmp_normal = minNorm;
+                else
+                {
+                    for (size_t tIdx = geom.triangleStart; tIdx < geom.triangleStart + geom.triangleCount; ++tIdx) {
+                        Triangle tri = triangles[tIdx];
+                        float curt = triangleIntersectionTest(geom, tri, pathSegment.ray, localRay, minInter, minNorm, outside);
+                        if (curt < t && curt > 0)
+                        {
+                            t = curt;
+                            tmp_intersect = minInter;
+                            tmp_normal = minNorm;
+                        }
                     }
                 }
-#endif
             }
             // TODO: add more intersection tests here... triangle? metaball? CSG?
 
@@ -456,6 +484,138 @@ __global__ void computeIntersections(
             intersections[path_index].surfaceNormal = normal;
         }
     }
+}
+
+// BVH debug view
+// Each camera ray does a traversal through the BVH
+// mode 0 colors triangles by the closest leaf node
+// mode 1 is a heat map of how many BVH nodes the ray popped off the stack
+// outlines can also be toggled
+__global__ void bvhDebugKernel(
+    int num_paths,
+    PathSegment* pathSegments,
+    Geom* geoms,
+    int geoms_size,
+    Triangle* triangles,
+    BVHNode* bvhNodes,
+    glm::vec3* image,
+    int mode,
+    bool outlines,
+    float pixelAngle)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_paths) return;
+
+    PathSegment path = pathSegments[idx];
+
+    float t = FLT_MAX;      // closest triangle hit (world units)
+    float tEdge = FLT_MAX;  // closest leaf-box edge (world units)
+    int visited = 0;
+    long long hitLeaf = -1;
+
+    glm::vec3 tmpIntersect;
+    glm::vec3 tmpNormal;
+    bool outside;
+
+    for (int g = 0; g < geoms_size; g++)
+    {
+        Geom& geom = geoms[g];
+        if (geom.type != MESH || geom.bvhRoot < 0) continue;
+
+        Ray localRay;
+        localRay.origin = multiplyMV(geom.inverseTransform, glm::vec4(path.ray.origin, 1.0f));
+        localRay.direction = glm::normalize(multiplyMV(geom.inverseTransform, glm::vec4(path.ray.direction, 0.0f)));
+        float toWorld = glm::length(multiplyMV(geom.transform, glm::vec4(localRay.direction, 0.0f)));
+
+        // create traversal stack, and load root
+        size_t stack[BVH_STACK_SIZE];
+        int stackPtr = 0;
+        stack[stackPtr++] = (size_t)geom.bvhRoot;
+
+        while (stackPtr > 0)
+        {
+            // pop node before processing
+            size_t nodeIdx = stack[--stackPtr];
+            BVHNode node = bvhNodes[nodeIdx];
+            // value for heat map
+            ++visited;
+
+            // skip if no intersection or not in front of everything else so far.
+            float tNear, tFar;
+            if (!aabbIntersectionTest(node.boundsMin, node.boundsMax, localRay, tNear, tFar))
+                continue;
+            if (tNear * toWorld > t)
+                continue;
+
+            // if leaf node
+            if (node.triangleCount > 0)
+            {
+                // check triangle intersections
+                for (size_t tIdx = node.triangleStart; tIdx < node.triangleStart + node.triangleCount; ++tIdx)
+                {
+                    float curt = triangleIntersectionTest(geom, triangles[tIdx], path.ray, localRay,
+                        tmpIntersect, tmpNormal, outside);
+                    // if hit and in front, update shortest distance and create seed for random color
+                    if (curt < t && curt > 0)
+                    {
+                        t = curt;
+                        hitLeaf = (long long)nodeIdx;
+                    }
+                }
+
+                if (outlines)
+                {
+                    // A box edge is where the ray enters or exits the box within a pixel or so of two faces at once.
+                    // Distances stay in object space; the outline width is one pixel's footprint at that distance.
+                    float hits[2] = { tNear, tFar };
+                    for (int k = 0; k < 2; ++k)
+                    {
+                        float tc = hits[k];
+                        // if we didn't hit anything or an edge is in front, continue
+                        if (tc <= 0.0f || tc * toWorld >= tEdge) continue;
+
+                        // intersect point
+                        glm::vec3 p = localRay.origin + tc * localRay.direction;
+                        // distance from face of slab
+                        glm::vec3 faceDist = glm::min(p - node.boundsMin, node.boundsMax - p);
+                        // BVH_OUTLINE_PIXELS * pixelAngle gives us a world space
+                        // distance equal to BVH_OUTLINE_PIXELS number of pixels.
+                        // we scale this value by the hit distance to make sure the lines don't disappear.
+                        float width = BVH_OUTLINE_PIXELS * pixelAngle * tc;
+                        // Cheaper to do this than a logical statement, we just are checking if we intersect with 2 or more faces
+                        int nearFaces = (faceDist.x < width) + (faceDist.y < width) + (faceDist.z < width);
+                        if (nearFaces >= 2) tEdge = tc * toWorld;
+                    }
+                }
+            }
+            // if not a leaf node, continue to children
+            else
+            {
+                stack[stackPtr++] = node.leftChild;
+                stack[stackPtr++] = node.rightChild;
+            }
+        }
+    }
+
+    glm::vec3 color(0.05f);
+    if (mode == 0)
+    {
+        if (hitLeaf >= 0)
+        {
+            unsigned int h = utilhash((unsigned int)hitLeaf);
+            color = 0.25f + 0.75f * glm::vec3(h & 255, (h >> 8) & 255, (h >> 16) & 255) / 255.0f;
+        }
+    }
+    else
+    {
+        float x = glm::min(visited / BVH_HEAT_MAX, 1.0f);
+        color = glm::vec3(x, 4.0f * x * (1.0f - x), 1.0f - x);  // blue (cheap) -> green -> red (expensive)
+    }
+
+    // Only edges in front of the surface or empty space are visible
+    if (outlines && tEdge < t) color = glm::vec3(1.0f);
+
+    image[path.pixelIndex] += color;
 }
 
 // LOOK: "fake" shader demonstrating what you might do with the info in
@@ -583,6 +743,13 @@ void pathtrace(uchar4* pbo, int frame, int iter)
     // * Finally, add this iteration's results to the image. This has been done
     //   for you.
 
+    // Runtime toggles for the GUI
+    const bool useBVH = guiData ? guiData->useBVH : true;
+    const bool sortByMaterial = guiData ? guiData->sortByMaterial : true;
+    const bool visualizeBVH = guiData ? guiData->visualizeBVH : false;
+
+    if (evStart) cudaEventRecord(evStart);
+
     generateRayFromCamera<<<blocksPerGrid2d, blockSize2d>>>(cam, iter, traceDepth, dev_paths);
     checkCUDAError("generate camera ray");
 
@@ -590,10 +757,21 @@ void pathtrace(uchar4* pbo, int frame, int iter)
     PathSegment* dev_path_end = dev_paths + pixelcount;
     int num_paths = dev_path_end - dev_paths;
 
+    // If we visualize the BVH, we skip regular rendering
+    // and do one iteration of this debug view
+    if (visualizeBVH)
+    {
+        bvhDebugKernel<<<(pixelcount + blockSize1d - 1) / blockSize1d, blockSize1d>>>(
+            pixelcount, dev_paths, dev_geoms, hst_scene->geoms.size(), dev_triangles, dev_bvhNodes,
+            dev_image, guiData->bvhVizMode, guiData->bvhOutlines, cam.pixelLength.y);
+        checkCUDAError("bvh debug view");
+        guiData->TracedDepth = 0;
+    }
+
     // --- PathSegment Tracing Stage ---
     // Shoot ray into scene, bounce between objects, push shading chunks
 
-    bool iterationComplete = false;
+    bool iterationComplete = visualizeBVH;
     while (!iterationComplete)
     {
         // clean shading chunks
@@ -609,18 +787,17 @@ void pathtrace(uchar4* pbo, int frame, int iter)
             dev_triangles,
             dev_bvhNodes,
             hst_scene->geoms.size(),
-            dev_intersections
+            dev_intersections,
+            useBVH
         );
         checkCUDAError("trace one bounce");
         cudaDeviceSynchronize();
         depth++;
 
-        #if SORTPATHSBYMATERIAL
-        if (depth >= SORT_MIN_DEPTH && num_paths >= SORT_MIN_PATHS)
+        if (sortByMaterial && depth >= SORT_MIN_DEPTH && num_paths >= SORT_MIN_PATHS)
         {
             sortPathsByMaterial(num_paths, blockSize1d);
         }
-        #endif
 
         // TODO:
         // --- Shading Stage ---
@@ -664,4 +841,14 @@ void pathtrace(uchar4* pbo, int frame, int iter)
     sendImageToPBO<<<blocksPerGrid2d, blockSize2d>>>(pbo, cam.resolution, iter, dev_image);
 
     checkCUDAError("pathtrace");
+
+    // GPU time for this iteration which we pass to GUI
+    if (evStop && guiData)
+    {
+        cudaEventRecord(evStop);
+        cudaEventSynchronize(evStop);
+        float ms = 0.0f;
+        cudaEventElapsedTime(&ms, evStart, evStop);
+        guiData->iterationMs = (guiData->iterationMs == 0.0f) ? ms : 0.9f * guiData->iterationMs + 0.1f * ms;
+    }
 }
